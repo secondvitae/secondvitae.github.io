@@ -298,7 +298,7 @@ class NetworkClient {
   connect(name) {
     return new Promise((resolve, reject) => {
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-      const url = `${proto}://${location.host}`;
+      const url = `${proto}://second-vitae-backend.onrender.com`;
       let settled = false;
       this.ws = new WebSocket(url);
 

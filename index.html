@@ -95,13 +95,16 @@
   #ammo-value { font-size: 26px; font-weight: bold; }
   #reload-indicator { font-size: 12px; color: var(--accent-warm); letter-spacing: 1px; margin-top: 2px; display: none; }
 
-  /* Sprint indicator */
-  #sprint-indicator {
+  /* Movement state indicator (sprint / slide / wallrun) */
+  #movement-indicator {
     position: absolute; bottom: 90px; right: 26px; display: none;
-    font-size: 11px; letter-spacing: 2px; color: var(--accent);
+    font-size: 11px; letter-spacing: 2px;
     background: var(--hud-bg); border: 1px solid var(--hud-border);
     padding: 4px 8px; border-radius: 4px;
   }
+  #movement-indicator.mode-sprint { color: var(--accent); }
+  #movement-indicator.mode-slide { color: var(--accent-warm); }
+  #movement-indicator.mode-wallrun { color: #4ee08a; }
 
   /* Top-left: connection / players */
   #status-panel {
@@ -206,7 +209,7 @@
     <div id="reload-indicator">RELOADING...</div>
   </div>
 
-  <div id="sprint-indicator">SPRINTING</div>
+  <div id="movement-indicator">SPRINTING</div>
 
   <div id="status-panel">
     <div id="conn-status" class="conn-disconnected">DISCONNECTED</div>
@@ -243,7 +246,9 @@
     <div id="menu-message"></div>
     <div id="menu-controls">
       WASD MOVE &nbsp;·&nbsp; MOUSE LOOK &nbsp;·&nbsp; SPACE JUMP &nbsp;·&nbsp; SHIFT SPRINT<br/>
-      CTRL/C CROUCH &nbsp;·&nbsp; LMB FIRE &nbsp;·&nbsp; R RELOAD &nbsp;·&nbsp; TAB SCORES &nbsp;·&nbsp; ` DEBUG
+      CTRL/C SLIDE (WHILE SPRINTING) &nbsp;·&nbsp; SPACE NEAR A WALL = WALLJUMP<br/>
+      LMB FIRE &nbsp;·&nbsp; R RELOAD &nbsp;·&nbsp; TAB SCORES &nbsp;·&nbsp; ` DEBUG<br/>
+      <span style="opacity:0.7">Movement lab through the north doorway — sprint, gaps, wallrun/walljump gauntlet, true slope + slide</span>
     </div>
   </div>
 </div>
@@ -264,12 +269,21 @@ const S = window.Shared;
 const RENDER = {
   mouseSensitivity: 0.0022,
   fov: 90,
-  sprintFov: 100,
-  fovLerpSpeed: 8,
+  fovLerpSpeed: 10,
+  // FOV is driven primarily by actual speed (not just a sprint flag) so
+  // acceleration itself is perceptible, per the "velocity-based FOV"
+  // approach: fast movement earns more FOV automatically, with small flat
+  // bonuses layered on top for wallrunning/sliding specifically.
+  speedFovBonus: 14,
+  speedFovReference: 20, // horizontal speed (m/s) at which the full bonus applies
+  wallrunFovBonus: 4,
+  slideFovBonus: 5,
   bobFrequency: 9,
   bobAmplitude: 0.045,
   bobSideAmplitude: 0.03,
   landingRecoverySpeed: 9,
+  wallrunRollAmount: 0.09,   // radians, banking into a wallrun
+  rollLerpSpeed: 10,
   interpDelayMs: S.NET.INTERP_DELAY_MS,
 };
 
@@ -439,11 +453,13 @@ class LocalPlayer {
   reconcile(serverPriv, lastProcessedInput, colliders) {
     const oldRender = this.renderPosition;
 
-    this.move.position = { ...serverPriv.pos };
-    this.move.velocity = { ...serverPriv.vel };
-    this.move.grounded = serverPriv.grounded;
-    this.move.crouching = serverPriv.crouching;
-    this.move.sprinting = serverPriv.sprinting;
+    // Replace the ENTIRE movement state wholesale (position, velocity, and
+    // every timer the pipeline tracks — coyote/jump-buffer/slide/wallrun/
+    // etc). Cherry-picking individual fields here is how prediction quietly
+    // drifts: any new field added to the pipeline would silently never
+    // reconcile. Deep-cloned so later local mutation can't alias the
+    // object the network layer just handed us.
+    this.move = JSON.parse(JSON.stringify(serverPriv.move));
 
     this.pendingInputs = this.pendingInputs.filter((i) => i.seq > lastProcessedInput);
     for (const input of this.pendingInputs) {
@@ -483,13 +499,58 @@ class LocalPlayer {
 // ===========================================================================
 // GEOMETRIC WORLD & PLAYER MODEL BUILDERS (low-poly primitives only)
 // ===========================================================================
+
+/**
+ * Visual mesh for a createSlope() collider. The slope's collision is
+ * handled analytically (see shared.js getSlopeGroundHeight) — this just
+ * builds a matching rotated box so it LOOKS like the incline it is.
+ * Alignment uses setFromUnitVectors rather than manual trig so the sign
+ * of the incline (rising or descending, +axis or -axis) can never produce
+ * a backwards rotation.
+ */
+function buildSlopeMesh(def) {
+  const dirVec = def.axis === 'z'
+    ? new THREE.Vector3(0, def.riseHeight, def.length * def.sign)
+    : new THREE.Vector3(def.length * def.sign, def.riseHeight, 0);
+  const hypot = dirVec.length();
+  dirVec.normalize();
+
+  const thickness = 0.6;
+  const geo = new THREE.BoxGeometry(
+    def.axis === 'z' ? def.width : hypot,
+    thickness,
+    def.axis === 'z' ? hypot : def.width
+  );
+  const mat = new THREE.MeshStandardMaterial({ color: def.color, roughness: 0.85, metalness: 0.04 });
+  const mesh = new THREE.Mesh(geo, mat);
+
+  const localAxis = def.axis === 'z' ? new THREE.Vector3(0, 0, 1) : new THREE.Vector3(1, 0, 0);
+  mesh.quaternion.setFromUnitVectors(localAxis, dirVec);
+
+  const mid = def.axis === 'z'
+    ? { x: def.start.x, y: def.start.y + def.riseHeight / 2, z: def.start.z + (def.length * def.sign) / 2 }
+    : { x: def.start.x + (def.length * def.sign) / 2, y: def.start.y + def.riseHeight / 2, z: def.start.z };
+  mesh.position.set(mid.x, mid.y, mid.z);
+  return mesh;
+}
+
 function buildArenaMeshes(scene, colliders) {
   const group = new THREE.Group();
   for (const def of colliders) {
-    const geo = new THREE.BoxGeometry(def.size.x, def.size.y, def.size.z);
-    const mat = new THREE.MeshStandardMaterial({ color: def.color, roughness: 0.85, metalness: 0.04 });
-    const mesh = new THREE.Mesh(geo, mat);
-    mesh.position.set(def.pos.x, def.pos.y, def.pos.z);
+    let mesh;
+    if (def.type === 'slope') {
+      mesh = buildSlopeMesh(def);
+    } else if (def.type === 'cone') {
+      const geo = new THREE.ConeGeometry(def.radius, def.height, 10);
+      const mat = new THREE.MeshStandardMaterial({ color: def.color, roughness: 0.6, metalness: 0.1 });
+      mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set(def.pos.x, def.pos.y, def.pos.z);
+    } else {
+      const geo = new THREE.BoxGeometry(def.size.x, def.size.y, def.size.z);
+      const mat = new THREE.MeshStandardMaterial({ color: def.color, roughness: 0.85, metalness: 0.04 });
+      mesh = new THREE.Mesh(geo, mat);
+      mesh.position.set(def.pos.x, def.pos.y, def.pos.z);
+    }
     group.add(mesh);
   }
   scene.add(group);
@@ -631,7 +692,9 @@ class RemoteEntity {
     this.buffer.push({
       t: recvTime,
       pos: { ...state.pos }, yaw: state.yaw,
-      crouching: state.crouching, lifeState: state.lifeState, health: state.health,
+      crouching: state.crouching, sliding: state.sliding,
+      wallrunning: state.wallrunning, wallrunSide: state.wallrunSide,
+      lifeState: state.lifeState, health: state.health,
     });
     const cutoff = recvTime - 1000;
     while (this.buffer.length > 2 && this.buffer[0].t < cutoff) this.buffer.shift();
@@ -646,23 +709,26 @@ class RemoteEntity {
     for (let i = 0; i < buf.length - 1; i++) {
       if (buf[i].t <= renderTime && buf[i + 1].t >= renderTime) { a = buf[i]; b = buf[i + 1]; break; }
     }
-    let pos, yaw, crouching, lifeState;
+    let pos, yaw, crouching, sliding, wallrunning, wallrunSide, lifeState;
     if (a && b) {
       const span = (b.t - a.t) || 1;
       const t = S.clamp((renderTime - a.t) / span, 0, 1);
       pos = { x: S.lerp(a.pos.x, b.pos.x, t), y: S.lerp(a.pos.y, b.pos.y, t), z: S.lerp(a.pos.z, b.pos.z, t) };
       yaw = S.lerpAngle(a.yaw, b.yaw, t);
-      crouching = b.crouching; lifeState = b.lifeState;
+      crouching = b.crouching; sliding = b.sliding; wallrunning = b.wallrunning; wallrunSide = b.wallrunSide; lifeState = b.lifeState;
     } else {
       const latest = buf[buf.length - 1];
-      pos = latest.pos; yaw = latest.yaw; crouching = latest.crouching; lifeState = latest.lifeState;
+      pos = latest.pos; yaw = latest.yaw; crouching = latest.crouching; sliding = latest.sliding;
+      wallrunning = latest.wallrunning; wallrunSide = latest.wallrunSide; lifeState = latest.lifeState;
     }
 
     this.model.visible = lifeState !== 'dead';
     this.model.position.set(pos.x, pos.y, pos.z);
     this.model.rotation.y = yaw;
-    const targetScaleY = crouching ? 0.74 : 1.0;
+    const targetScaleY = sliding ? 0.55 : crouching ? 0.74 : 1.0;
     this.model.scale.y = S.lerp(this.model.scale.y, targetScaleY, Math.min(1, dt * 10));
+    const targetRoll = wallrunning ? (wallrunSide === 'left' ? 0.35 : -0.35) : 0;
+    this.model.rotation.z = S.lerp(this.model.rotation.z, targetRoll, Math.min(1, dt * 10));
 
     const speed = Math.hypot(pos.x - this.lastPos.x, pos.z - this.lastPos.z) / Math.max(dt, 0.0001);
     this.lastPos = pos;
@@ -813,6 +879,7 @@ class AudioManager {
   playHitmarker() { this._tone(1200, 0.05, 'sine', 0.12); }
   playDamage() { this._tone(220, 0.15, 'sawtooth', 0.12); }
   playJump() { this._tone(500, 0.07, 'triangle', 0.07); }
+  playWalljump() { this._tone(650, 0.05, 'triangle', 0.08); this._tone(950, 0.05, 'triangle', 0.06); }
   playLand() { this._tone(150, 0.08, 'sine', 0.09); }
   playDeath() { this._tone(90, 0.4, 'sawtooth', 0.15); }
 }
@@ -836,7 +903,7 @@ class UIManager {
       ammoValue: document.getElementById('ammo-value'),
       weaponName: document.getElementById('weapon-name'),
       reloadIndicator: document.getElementById('reload-indicator'),
-      sprintIndicator: document.getElementById('sprint-indicator'),
+      movementIndicator: document.getElementById('movement-indicator'),
       connStatus: document.getElementById('conn-status'),
       playerCount: document.getElementById('player-count'),
       pingValue: document.getElementById('ping-value'),
@@ -915,7 +982,7 @@ class UIManager {
     const weaponDef = game.weapons ? game.weapons[w.weaponId || S.DEFAULT_WEAPON] : null;
     this.el.weaponName.textContent = weaponDef ? weaponDef.name.toUpperCase() : '';
     this.el.reloadIndicator.style.display = w.reloading ? 'block' : 'none';
-    this.el.sprintIndicator.style.display = (game.localPlayer && game.localPlayer.move.sprinting) ? 'block' : 'none';
+    this.updateMovementIndicator(game.localPlayer && game.localPlayer.move);
     this.el.playerCount.textContent = `${game.playerCount || 1} PLAYERS`;
     this.el.pingValue.textContent = `${game.network.ping || 0} ms`;
 
@@ -933,16 +1000,42 @@ class UIManager {
     if (game.debugEnabled) this.updateDebug(game);
   }
 
+  updateMovementIndicator(move) {
+    const el = this.el.movementIndicator;
+    el.classList.remove('mode-sprint', 'mode-slide', 'mode-wallrun');
+    if (!move) { el.style.display = 'none'; return; }
+    let label = null, mode = null;
+    if (move.wallrunning) { label = `WALLRUNNING (${move.wallrunSide === 'left' ? 'L' : 'R'})`; mode = 'mode-wallrun'; }
+    else if (move.sliding) { label = 'SLIDING'; mode = 'mode-slide'; }
+    else if (move.sprinting) { label = 'SPRINTING'; mode = 'mode-sprint'; }
+    if (label) { el.textContent = label; el.classList.add(mode); el.style.display = 'block'; }
+    else el.style.display = 'none';
+  }
+
   updateDebug(game) {
     const p = game.localPlayer;
-    const pos = p ? p.move.position : { x: 0, y: 0, z: 0 };
-    const vel = p ? p.move.velocity : { x: 0, y: 0, z: 0 };
+    const move = p ? p.move : null;
+    const pos = move ? move.position : { x: 0, y: 0, z: 0 };
+    const vel = move ? move.velocity : { x: 0, y: 0, z: 0 };
+    const horizSpeed = Math.hypot(vel.x, vel.z);
+    const totalSpeed = Math.hypot(vel.x, vel.y, vel.z);
+
+    const flags = [];
+    if (move) {
+      if (move.grounded) flags.push('GROUNDED'); else flags.push('AIRBORNE');
+      if (move.sprinting) flags.push('SPRINT');
+      if (move.crouching) flags.push('CROUCH');
+      if (move.sliding) flags.push('SLIDE');
+      if (move.wallrunning) flags.push(`WALLRUN(${move.wallrunSide})`);
+    }
+
     this.el.debugPanel.innerHTML =
-      `FPS: ${(game.fps || 0).toFixed(0)} &nbsp; | &nbsp; Server tick: ${game.serverTick || '-'} &nbsp; | &nbsp; Ping: ${game.network.ping || 0}ms<br>` +
+      `FPS: ${(game.fps || 0).toFixed(0)} &nbsp; | &nbsp; Server tick: ${game.serverTick || '-'} &nbsp; | &nbsp; Ping: ${game.network.ping || 0}ms &nbsp; | &nbsp; Players: ${game.playerCount || 1}<br>` +
       `Pos: ${pos.x.toFixed(2)}, ${pos.y.toFixed(2)}, ${pos.z.toFixed(2)} &nbsp; | &nbsp; ` +
       `Vel: ${vel.x.toFixed(2)}, ${vel.y.toFixed(2)}, ${vel.z.toFixed(2)}<br>` +
-      `Grounded: ${p ? p.move.grounded : '-'} &nbsp; | &nbsp; Input seq: ${p ? p.seq : '-'} &nbsp; | &nbsp; ` +
-      `Entities: ${game.remoteEntities.size + 1} &nbsp; | &nbsp; Players: ${game.playerCount || 1}`;
+      `Speed (horiz/total): ${horizSpeed.toFixed(2)} / ${totalSpeed.toFixed(2)} &nbsp; | &nbsp; ` +
+      `State: ${flags.join(' + ') || '-'}<br>` +
+      `Input seq: ${p ? p.seq : '-'} &nbsp; | &nbsp; Entities: ${game.remoteEntities.size + 1}`;
   }
 }
 
@@ -971,6 +1064,7 @@ class Game {
 
     this.landingOffset = 0;
     this.bobPhase = 0;
+    this.cameraRoll = 0;
     this._swayYaw = 0;
     this._swayPitch = 0;
     this._lastYaw = 0;
@@ -993,7 +1087,7 @@ class Game {
   _initScene() {
     this.scene = new THREE.Scene();
     this.scene.background = new THREE.Color(0x0b1622);
-    this.scene.fog = new THREE.Fog(0x0b1622, 45, 150);
+    this.scene.fog = new THREE.Fog(0x0b1622, 45, 220);
 
     this.camera = new THREE.PerspectiveCamera(RENDER.fov, window.innerWidth / window.innerHeight, 0.05, 500);
     this.camera.rotation.order = 'YXZ';
@@ -1081,7 +1175,7 @@ class Game {
 
     buildArenaMeshes(this.scene, msg.arena.colliders);
 
-    this.localPlayer = new LocalPlayer(msg.you.pos);
+    this.localPlayer = new LocalPlayer(msg.you.move.position);
     this.look.set(msg.you.yaw, msg.you.pitch);
     this.localWeapon = msg.you;
 
@@ -1220,7 +1314,8 @@ class Game {
     if (this.localPlayer.pendingInputs.length > 240) this.localPlayer.pendingInputs.shift();
     this.network.send({ type: 'input', ...input });
 
-    if (events.jumped) this.audio.playJump();
+    if (events.walljumped) { this.audio.playWalljump(); this.effects.triggerShake(0.04); }
+    else if (events.jumped) this.audio.playJump();
     if (events.landed) {
       this.audio.playLand();
       this.landingOffset = Math.min(0.3, events.landSpeed * 0.01);
@@ -1259,13 +1354,21 @@ class Game {
     if (this.localPlayer) {
       this.localPlayer.decayVisualError(dt);
       const feet = this.localPlayer.renderPosition;
-      const crouching = this.localPlayer.move.crouching;
-      const targetEye = crouching ? S.MOVEMENT.crouchEyeHeight : S.MOVEMENT.eyeHeight;
+      const move = this.localPlayer.move;
+
+      const targetEye = move.sliding ? S.MOVEMENT.slideEyeHeight
+        : move.crouching ? S.MOVEMENT.crouchEyeHeight
+        : S.MOVEMENT.eyeHeight;
       this.currentEyeHeight = S.lerp(this.currentEyeHeight, targetEye, Math.min(1, dt * 12));
 
-      const horizSpeed = Math.hypot(this.localPlayer.move.velocity.x, this.localPlayer.move.velocity.z);
+      const horizSpeed = Math.hypot(move.velocity.x, move.velocity.z);
+      const totalSpeed = Math.hypot(move.velocity.x, move.velocity.y, move.velocity.z);
+
+      // Camera bob only while actually running on the ground — sliding and
+      // wallrunning have their own distinct feedback instead (lowered eye,
+      // roll) so they don't fight the bob for the same visual space.
       let bobY = 0, bobX = 0;
-      if (this.localPlayer.move.grounded && horizSpeed > 0.5) {
+      if (move.grounded && !move.sliding && horizSpeed > 0.5) {
         const bobScale = Math.min(horizSpeed / S.MOVEMENT.walkSpeed, 1.6);
         this.bobPhase += dt * RENDER.bobFrequency * bobScale;
         bobY = Math.sin(this.bobPhase * 2) * RENDER.bobAmplitude * bobScale;
@@ -1274,12 +1377,25 @@ class Game {
 
       this.landingOffset *= Math.exp(-dt * RENDER.landingRecoverySpeed);
 
+      // Wallrun banking: lean into the wall you're running on.
+      const targetRoll = move.wallrunning
+        ? (move.wallrunSide === 'left' ? RENDER.wallrunRollAmount : -RENDER.wallrunRollAmount)
+        : 0;
+      this.cameraRoll = S.lerp(this.cameraRoll, targetRoll, Math.min(1, dt * RENDER.rollLerpSpeed));
+
       this.camera.position.set(feet.x + bobX, feet.y + this.currentEyeHeight + bobY - this.landingOffset, feet.z);
       this.camera.rotation.x = this.look.pitch;
       this.camera.rotation.y = this.look.yaw;
-      this.camera.rotation.z = 0;
+      this.camera.rotation.z = this.cameraRoll;
 
-      const targetFov = this.localPlayer.move.sprinting ? RENDER.sprintFov : RENDER.fov;
+      // Velocity-based FOV: speed itself is what earns extra field of
+      // view, not a sprint flag, so acceleration is perceptible the
+      // instant it happens (walking off a wallrun into a sprint doesn't
+      // pop the FOV, it eases in exactly as fast as the speed does).
+      const speedRatio = S.clamp(horizSpeed / RENDER.speedFovReference, 0, 1);
+      let targetFov = RENDER.fov + speedRatio * RENDER.speedFovBonus;
+      if (move.wallrunning) targetFov += RENDER.wallrunFovBonus;
+      if (move.sliding) targetFov += RENDER.slideFovBonus;
       this.camera.fov = S.lerp(this.camera.fov, targetFov, Math.min(1, dt * RENDER.fovLerpSpeed));
       this.camera.updateProjectionMatrix();
 
